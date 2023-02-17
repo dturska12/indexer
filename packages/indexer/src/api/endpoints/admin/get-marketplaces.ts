@@ -63,10 +63,10 @@ export const getMarketplaces: RouteOptions = {
         name: "OpenSea",
         imageUrl: "https://api.reservoir.tools/redirect/sources/opensea/logo/v2",
         fee: {
-          percent: 2.5,
-          bps: 250,
+          percent: 0,
+          bps: 0,
         },
-        feeBps: 0.025,
+        feeBps: 0,
         orderbook: "opensea",
         orderKind: "seaport",
         listingEnabled: false,
