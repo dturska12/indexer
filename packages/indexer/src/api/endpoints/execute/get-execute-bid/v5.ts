@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
+import { BigNumber } from "@ethersproject/bignumber";
 import * as Boom from "@hapi/boom";
 import { Request, RouteOptions } from "@hapi/hapi";
 import * as Sdk from "@reservoir0x/sdk";
@@ -11,6 +12,8 @@ import { logger } from "@/common/logger";
 import { baseProvider } from "@/common/provider";
 import { bn, regex } from "@/common/utils";
 import { config } from "@/config/index";
+import { getNetworkSettings } from "@/config/network";
+import { getFtBalance } from "@/orderbook/orders/common/helpers";
 
 // LooksRare
 import * as looksRareBuyToken from "@/orderbook/orders/looks-rare/build/buy/token";
@@ -232,16 +235,6 @@ export const getExecuteBidV5Options: RouteOptions = {
         nonce?: string;
       }[];
 
-      // TODO: This shouldn't be here
-      let currency = "ETH";
-      let wrappedCurrency = "WETH";
-      switch (config.chainId) {
-        case 137:
-          currency = "MATIC";
-          wrappedCurrency = "WMATIC";
-          break;
-      }
-
       // Set up generic bid steps
       const steps: {
         id: string;
@@ -255,17 +248,17 @@ export const getExecuteBidV5Options: RouteOptions = {
         }[];
       }[] = [
         {
-          id: "currency-wrapping",
-          action: `Wrapping ${currency}`,
-          description: `We'll ask your approval for converting ${currency} to ${wrappedCurrency}. Gas fee required.`,
+          id: "currency-approval",
+          action: "Approve currency",
+          description:
+            "We'll ask your approval for the exchange to access your token. This is a one-time only operation per exchange.",
           kind: "transaction",
           items: [],
         },
         {
-          id: "currency-approval",
-          action: `Approve ${wrappedCurrency} contract`,
-          description:
-            "We'll ask your approval for the exchange to access your token. This is a one-time only operation per exchange.",
+          id: "currency-conversion",
+          action: "Convert currency",
+          description: "We'll ask your approval for converting your token. Gas fee required.",
           kind: "transaction",
           items: [],
         },
@@ -300,6 +293,9 @@ export const getExecuteBidV5Options: RouteOptions = {
         }[],
       };
 
+      // Keep track of any currency conversions that are needed
+      const currencyAmount: { [currency: string]: BigNumber } = {};
+
       const errors: { message: string; orderIndex: number }[] = [];
       await Promise.all(
         params.map(async (params, i) => {
@@ -308,6 +304,19 @@ export const getExecuteBidV5Options: RouteOptions = {
           const tokenSetId = params.tokenSetId;
           const attributeKey = params.attributeKey;
           const attributeValue = params.attributeValue;
+
+          // Keep track of the currency amount needed
+          if (!getNetworkSettings().supportedBidCurrencies[params.currency]) {
+            return errors.push({
+              message: `Currency ${params.currency} not supported for bidding`,
+              orderIndex: i,
+            });
+          } else {
+            if (!currencyAmount[params.currency]) {
+              currencyAmount[params.currency] = bn(0);
+            }
+            currencyAmount[params.currency] = currencyAmount[params.currency].add(params.weiPrice);
+          }
 
           // Only single-contract token sets are biddable
           if (tokenSetId && tokenSetId.startsWith("list") && tokenSetId.split(":").length !== 3) {
@@ -337,38 +346,6 @@ export const getExecuteBidV5Options: RouteOptions = {
           }
 
           try {
-            // Check the maker's balance
-            const currency = new Sdk.Common.Helpers.Erc20(baseProvider, params.currency);
-            const currencyBalance = await currency.getBalance(maker);
-            if (bn(currencyBalance).lt(params.weiPrice)) {
-              if (params.currency === Sdk.Common.Addresses.Weth[config.chainId]) {
-                const ethBalance = await baseProvider.getBalance(maker);
-                if (bn(currencyBalance).add(ethBalance).lt(params.weiPrice)) {
-                  return errors.push({
-                    message: "Maker does not have sufficient balance",
-                    orderIndex: i,
-                  });
-                } else {
-                  const weth = new Sdk.Common.Helpers.Weth(baseProvider, config.chainId);
-                  const wrapTx = weth.depositTransaction(
-                    maker,
-                    bn(params.weiPrice).sub(currencyBalance)
-                  );
-
-                  steps[0].items.push({
-                    status: "incomplete",
-                    data: wrapTx,
-                    orderIndexes: [i],
-                  });
-                }
-              } else {
-                return errors.push({
-                  message: "Maker does not have sufficient balance",
-                  orderIndex: i,
-                });
-              }
-            }
-
             const attribute =
               collectionId && attributeKey && attributeValue
                 ? {
@@ -380,6 +357,7 @@ export const getExecuteBidV5Options: RouteOptions = {
             const collection =
               collectionId && !attributeKey && !attributeValue ? collectionId : undefined;
 
+            const currency = new Sdk.Common.Helpers.Erc20(baseProvider, params.currency);
             switch (params.orderKind) {
               case "seaport": {
                 if (!["reservoir"].includes(params.orderbook)) {
@@ -442,7 +420,7 @@ export const getExecuteBidV5Options: RouteOptions = {
                   approvalTx = currency.approveTransaction(maker, conduit);
                 }
 
-                steps[1].items.push({
+                steps[0].items.push({
                   status: !approvalTx ? "complete" : "incomplete",
                   data: approvalTx,
                   orderIndexes: [i],
@@ -560,7 +538,7 @@ export const getExecuteBidV5Options: RouteOptions = {
                   approvalTx = currency.approveTransaction(maker, conduit);
                 }
 
-                steps[1].items.push({
+                steps[0].items.push({
                   status: !approvalTx ? "complete" : "incomplete",
                   data: approvalTx,
                   orderIndexes: [i],
@@ -648,7 +626,7 @@ export const getExecuteBidV5Options: RouteOptions = {
                   );
                 }
 
-                steps[1].items.push({
+                steps[0].items.push({
                   status: !approvalTx ? "complete" : "incomplete",
                   data: approvalTx,
                   orderIndexes: [i],
@@ -738,7 +716,7 @@ export const getExecuteBidV5Options: RouteOptions = {
                   );
                 }
 
-                steps[1].items.push({
+                steps[0].items.push({
                   status: !approvalTx ? "complete" : "incomplete",
                   data: approvalTx,
                   orderIndexes: [i],
@@ -832,7 +810,7 @@ export const getExecuteBidV5Options: RouteOptions = {
                   );
                 }
 
-                steps[1].items.push({
+                steps[0].items.push({
                   status: !approvalTx ? "complete" : "incomplete",
                   data: approvalTx,
                   orderIndexes: [i],
@@ -925,7 +903,7 @@ export const getExecuteBidV5Options: RouteOptions = {
                   );
                 }
 
-                steps[1].items.push({
+                steps[0].items.push({
                   status: !approvalTx ? "complete" : "incomplete",
                   data: approvalTx,
                   orderIndexes: [i],
@@ -1011,7 +989,7 @@ export const getExecuteBidV5Options: RouteOptions = {
                   );
                 }
 
-                steps[1].items.push({
+                steps[0].items.push({
                   status: !approvalTx ? "complete" : "incomplete",
                   data: approvalTx,
                   orderIndexes: [i],
@@ -1084,7 +1062,7 @@ export const getExecuteBidV5Options: RouteOptions = {
                   );
                 }
 
-                steps[1].items.push({
+                steps[0].items.push({
                   status: !approvalTx ? "complete" : "incomplete",
                   data: approvalTx,
                   orderIndexes: [i],
@@ -1128,7 +1106,7 @@ export const getExecuteBidV5Options: RouteOptions = {
         const orders = bulkOrders["seaport-v1.4"];
         if (orders.length === 1) {
           const order = new Sdk.SeaportV14.Order(config.chainId, orders[0].order.data);
-          steps[1].items.push({
+          steps[0].items.push({
             status: "incomplete",
             data: {
               sign: order.getSignatureData(),
@@ -1192,7 +1170,14 @@ export const getExecuteBidV5Options: RouteOptions = {
         }
       }
 
-      // We should only have a single wrapping transaction
+      // Generate currency conversion transactions
+      for (const [currency, amount] of Object.entries(currencyAmount)) {
+        const ownedAmount = await getFtBalance(currency, maker);
+        if (ownedAmount.lt(amount)) {
+          // Conversion needed
+        }
+      }
+
       if (steps[0].items.length > 1) {
         let amount = bn(0);
         for (let i = 0; i < steps[0].items.length; i++) {
